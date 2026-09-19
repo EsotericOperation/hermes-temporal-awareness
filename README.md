@@ -4,6 +4,8 @@
 
 A Hermes plugin that injects time-of-day and session recency context into your message before each LLM call. When you return to a session after a gap, Hermes greets you with awareness — how long you've been away, what time it is, whether you're in night-shift mode.
 
+> **Note:** This is a community-maintained plugin, not an official Nous Research project. It uses the public `pre_llm_call` hook and does not modify Hermes core. File issues and PRs on GitHub.
+
 ## How it works
 
 The plugin rides the `pre_llm_call` hook — a Hermes feature that lets plugins inject text into the user message before it goes to the LLM.
