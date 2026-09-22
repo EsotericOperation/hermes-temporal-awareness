@@ -1,19 +1,21 @@
-"""Temporal Awareness plugin — inject time-of-day and session recency context into the user message before each LLM call.
+"""Spatiotemporal Contextual Awareness plugin — inject time-of-day, session recency,
+and cross-platform context into the user message before each LLM call.
 
 Cache-safe: rides the pre_llm_call hook (injected into user message, never the system prompt).
 Only fires when the user has been away for longer than the configured threshold to avoid
 injecting redundant context on rapid back-and-forth turns.
 
-Config (in config.yaml under ``agent.temporal_awareness``):
+Config (in config.yaml under ``agent.spatiotemporal_contextual_awareness``):
 
     agent:
-      temporal_awareness:
+      spatiotemporal_contextual_awareness:
         enabled: true
         threshold_minutes: 30      # how long silence before we inject context
         night_shift_start: 22      # 24h hour for "night shift" tailoring
         night_shift_end: 5         # 24h hour for end of night shift
         show_last_active: true     # include "last message was on..." line
         show_date_change: true     # include "returned on a new day" line
+        show_platform_change: true # include cross-platform handoff context
 
 Environment:
     HERMES_TEMPORAL_AWARENESS_THRESHOLD_MINUTES  # overrides config (takes priority)
@@ -22,6 +24,7 @@ Environment:
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -32,7 +35,7 @@ from typing import Any
 # --- Config ---
 
 def _load_config(cfg: Any = None) -> dict:
-    """Load plugin-specific config from agent.temporal_awareness section."""
+    """Load plugin-specific config from agent.spatiotemporal_contextual_awareness section."""
     if cfg is None:
         try:
             from hermes_cli.config import load_config
@@ -41,7 +44,7 @@ def _load_config(cfg: Any = None) -> dict:
             return {}
     
     agent = cfg.get("agent") or {}
-    ta_cfg = agent.get("temporal_awareness") or {}
+    ta_cfg = agent.get("spatiotemporal_contextual_awareness") or agent.get("temporal_awareness") or {}
     
     # Config defaults
     out = {
@@ -51,6 +54,7 @@ def _load_config(cfg: Any = None) -> dict:
         "night_shift_end": ta_cfg.get("night_shift_end", 5),
         "show_last_active": ta_cfg.get("show_last_active", True),
         "show_date_change": ta_cfg.get("show_date_change", True),
+        "show_platform_change": ta_cfg.get("show_platform_change", True),
     }
     
     # Environment overrides (for quick tweaks without editing config.yaml)
@@ -114,6 +118,24 @@ def _session_started_unix(session_id: str) -> float | None:
         return None
 
 
+def _session_platform(session_id: str) -> str | None:
+    """Return the platform name for a session from origin_json, or None."""
+    if not session_id:
+        return None
+    try:
+        conn = _get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT origin_json FROM sessions WHERE id = ?", (session_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            origin = json.loads(row[0])
+            return origin.get("platform")
+    except Exception:
+        pass
+    return None
+
+
 # --- Formatting ---
 
 def _format_duration(seconds: float) -> str:
@@ -142,6 +164,23 @@ def _get_time_period(hour: int) -> str:
         return "night"
 
 
+def _platform_display_name(platform: str) -> str:
+    """Human-readable platform name."""
+    names = {
+        "telegram": "Telegram",
+        "discord": "Discord",
+        "signal": "Signal",
+        "photon": "Photon",
+        "desktop": "Desktop",
+        "cli": "CLI",
+        "tui": "TUI",
+        "webui": "WebUI",
+        "api_server": "API",
+        "abyss": "Abyss iOS",
+    }
+    return names.get(platform, platform.title() if platform else "Unknown")
+
+
 # --- Hook ---
 
 def on_pre_llm_call(
@@ -158,70 +197,92 @@ def on_pre_llm_call(
     sender_id: str = "",
     **_: Any,
 ) -> dict:
-    """Inject temporal context into the user message when returning after a gap.
+    """Inject temporal + platform context into the user message.
 
     Cache-safe: only adds to user message content, never touches the system prompt.
     Returns a dict with ``context`` key so the Hermes hook runner appends it.
+
+    Fires when:
+    - The user has been away longer than the configured threshold (temporal gap)
+    - OR the user is accessing a session from a different platform than where it started
     """
-    # Load config (once per call — cheap, cached by Python import machinery)
     cfg = _load_config()
     
     if not cfg["enabled"]:
         return {"context": ""}
     
     now = time.time()
-    
-    # Get the last activity timestamp from the session
     last_active = _session_last_active_unix(session_id)
-    if last_active is None:
-        return {"context": ""}
+    gap_seconds = (now - last_active) if last_active else None
     
-    gap_seconds = now - last_active
+    # Standard temporal gap path — only when session has history
     threshold_seconds = cfg["threshold_minutes"] * 60
+    temporal_fires = gap_seconds is not None and gap_seconds >= threshold_seconds
     
-    # Only inject if the user has been away longer than the threshold
-    if gap_seconds < threshold_seconds:
+    # Platform awareness — compare session's origin platform with current platform
+    # This fires ANY time they differ, regardless of turn count or gap
+    platform_fires = False
+    platform_part = ""
+    if cfg["show_platform_change"] and session_id:
+        session_platform = _session_platform(session_id)
+        if session_platform and session_platform != platform:
+            platform_fires = True
+            origin_name = _platform_display_name(session_platform)
+            current_name = _platform_display_name(platform)
+            platform_part = (
+                f"Platform context: This session was started on {origin_name}. "
+                f"You are now resuming from {current_name}."
+            )
+    
+    # Neither condition met — return empty
+    if not temporal_fires and not platform_fires:
         return {"context": ""}
     
-    # Format timestamps in local time
-    now_dt = datetime.fromtimestamp(now)
-    last_dt = datetime.fromtimestamp(last_active)
+    # Temporal context (gap-based)
+    parts = []
+    if temporal_fires:
+        # Format timestamps in local time
+        now_dt = datetime.fromtimestamp(now)
+        last_dt = datetime.fromtimestamp(last_active)
+        
+        gap_human = _format_duration(gap_seconds)
+        hour = now_dt.hour
+        time_period = _get_time_period(hour)
+        
+        day_name = now_dt.strftime("%A")
+        date_str = now_dt.strftime("%B %d, %Y")
+        time_str = now_dt.strftime("%I:%M %p").lstrip("0")
+        
+        parts.append(f"Temporal context: You are resuming this session after {gap_human} away.")
+        parts.append(f"Current time: {day_name}, {date_str} — {time_str} ({time_period} shift).")
+        
+        # Last active info
+        if cfg["show_last_active"]:
+            last_time_str = last_dt.strftime("%I:%M %p").lstrip("0")
+            last_day_str = last_dt.strftime("%A")
+            parts.append(f"Last message was on {last_day_str} at {last_time_str}.")
+        
+        # Day change
+        if cfg["show_date_change"] and now_dt.date() != last_dt.date():
+            parts.append("The user has returned on a new day.")
+        
+        # Night shift awareness
+        night_start = cfg["night_shift_start"]
+        night_end = cfg["night_shift_end"]
+        if night_start > night_end:  # wraps midnight
+            in_night = hour >= night_start or hour < night_end
+        else:
+            in_night = night_start <= hour < night_end
+        
+        if in_night:
+            parts.append(
+                f"User is in night-shift hours ({night_start}:00–{night_end}:00). "
+                "Energy may be lower, context-switching cost is higher — be direct and don't meander."
+            )
     
-    gap_human = _format_duration(gap_seconds)
-    hour = now_dt.hour
-    time_period = _get_time_period(hour)
-    
-    day_name = now_dt.strftime("%A")
-    date_str = now_dt.strftime("%B %d, %Y")
-    time_str = now_dt.strftime("%I:%M %p").lstrip("0")
-    
-    # Build context string
-    parts = [f"Temporal context: You are resuming this session after {gap_human} away."]
-    parts.append(f"Current time: {day_name}, {date_str} — {time_str} ({time_period} shift).")
-    
-    # Last active info
-    if cfg["show_last_active"]:
-        last_time_str = last_dt.strftime("%I:%M %p").lstrip("0")
-        last_day_str = last_dt.strftime("%A")
-        parts.append(f"Last message was on {last_day_str} at {last_time_str}.")
-    
-    # Day change
-    if cfg["show_date_change"] and now_dt.date() != last_dt.date():
-        parts.append("The user has returned on a new day.")
-    
-    # Night shift awareness
-    night_start = cfg["night_shift_start"]
-    night_end = cfg["night_shift_end"]
-    if night_start > night_end:  # wraps midnight
-        in_night = hour >= night_start or hour < night_end
-    else:
-        in_night = night_start <= hour < night_end
-    
-    if in_night:
-        parts.append(
-            f"User is in night-shift hours ({night_start}:00–{night_end}:00). "
-            "Energy may be lower, context-switching cost is higher — be direct and don't meander."
-        )
+    # Platform context — appended after temporal (or standalone if no temporal)
+    if platform_part:
+        parts.append(platform_part)
     
     return {"context": " ".join(parts)}
 

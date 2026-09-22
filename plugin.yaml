@@ -1,0 +1,7 @@
+name: spatiotemporal-contextual-awareness
+version: "1.1.0"
+description: "Spatiotemporal + contextual awareness — inject time-of-day, session recency, and cross-platform context into the user message before each LLM call"
+author: EsotericOperation
+kind: standalone
+provides_hooks:
+  - pre_llm_call

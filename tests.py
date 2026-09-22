@@ -1,4 +1,4 @@
-"""Test suite for temporal_awareness plugin.
+"""Test suite for spatiotemporal_contextual_awareness plugin.
 
 These tests are intentionally minimal — they verify that the configuration loading,
 duration formatting, and time period detection functions work correctly.
@@ -15,7 +15,7 @@ import pytest
 
 # Ensure plugin is importable
 sys.path.insert(0, str(Path.home() / ".hermes" / "plugins"))
-import temporal_awareness as ta
+import spatiotemporal_contextual_awareness as ta
 
 
 class TestConfig:
@@ -168,7 +168,7 @@ class TestOnPreLLMCall:
     def test_night_shift_appended(self, mock_last):
         """During night shift hours, night-shift note should be appended."""
         # Mock night time (1 AM)
-        with patch("temporal_awareness.time") as mock_time:
+        with patch("spatiotemporal_contextual_awareness.time") as mock_time:
             mock_time.time.return_value = 1740000000.0  # some unix time
             mock_last.return_value = 1740000000.0 - 3600  # 1 hour ago
             # This test is brittle because datetime.now() uses real time
@@ -196,6 +196,118 @@ class TestOnPreLLMCall:
                 is_first_turn=False,
             )
             assert result == {"context": ""}
+
+
+class TestPlatformDisplayName:
+    """Platform name formatting."""
+
+    def test_telegram(self):
+        assert ta._platform_display_name("telegram") == "Telegram"
+
+    def test_discord(self):
+        assert ta._platform_display_name("discord") == "Discord"
+
+    def test_signal(self):
+        assert ta._platform_display_name("signal") == "Signal"
+
+    def test_desktop(self):
+        assert ta._platform_display_name("desktop") == "Desktop"
+
+    def test_cli(self):
+        assert ta._platform_display_name("cli") == "CLI"
+
+    def test_unknown_platform(self):
+        assert ta._platform_display_name("foobar") == "Foobar"
+
+
+class TestSessionPlatform:
+    """Session origin platform extraction."""
+
+    @patch.object(ta, "_get_db")
+    def test_returns_platform_from_origin_json(self, mock_db):
+        import json
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.fetchone.return_value = [
+            json.dumps({"platform": "telegram", "chat_name": "Test"})
+        ]
+        mock_db.return_value = mock_conn
+        assert ta._platform_display_name("telegram") == "Telegram"
+
+    @patch.object(ta, "_get_db")
+    def test_returns_none_on_missing_session(self, mock_db):
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.fetchone.return_value = None
+        mock_db.return_value = mock_conn
+        assert ta._session_platform("nonexistent") is None
+
+
+class TestCrossPlatformInjection:
+    """Cross-platform context injection in the hook."""
+
+    @patch.object(ta, "_session_last_active_unix", return_value=time.time())
+    @patch.object(ta, "_session_platform", return_value="telegram")
+    def test_different_platform_injects_context(self, mock_plat, mock_last):
+        """When current platform differs from session origin, context fires."""
+        result = ta.on_pre_llm_call(
+            session_id="test-sess",
+            is_first_turn=False,
+            platform="desktop",
+            sender_id="user123",
+        )
+        ctx = result.get("context", "")
+        assert ctx != ""
+        assert "Platform context:" in ctx
+        assert "Telegram" in ctx
+        assert "Desktop" in ctx
+
+    @patch.object(ta, "_session_last_active_unix", return_value=time.time())
+    @patch.object(ta, "_session_platform", return_value="telegram")
+    def test_same_platform_no_platform_context(self, mock_plat, mock_last):
+        """When current platform matches session origin, no platform context."""
+        result = ta.on_pre_llm_call(
+            session_id="test-sess",
+            is_first_turn=False,
+            platform="telegram",
+            sender_id="user123",
+        )
+        ctx = result.get("context", "")
+        # Context may still fire from temporal gap, but should NOT have platform part
+        assert "Platform context:" not in ctx
+
+    @patch.object(ta, "_session_last_active_unix", return_value=time.time())
+    @patch.object(ta, "_session_platform", return_value="telegram")
+    def test_show_platform_change_disabled(self, mock_plat, mock_last):
+        """If show_platform_change is disabled, no platform context."""
+        with patch.object(ta, "_load_config", return_value={
+            "enabled": True,
+            "threshold_minutes": 30,
+            "night_shift_start": 22,
+            "night_shift_end": 5,
+            "show_last_active": True,
+            "show_date_change": True,
+            "show_platform_change": False,
+        }):
+            result = ta.on_pre_llm_call(
+                session_id="test-sess",
+                is_first_turn=False,
+                platform="desktop",
+                sender_id="user123",
+            )
+            ctx = result.get("context", "")
+            assert "Platform context:" not in ctx
+
+    @patch.object(ta, "_session_last_active_unix", return_value=None)
+    @patch.object(ta, "_session_platform", return_value="telegram")
+    def test_no_history_different_platform_fires(self, mock_plat, mock_last):
+        """No prior activity + different platform → platform context fires."""
+        result = ta.on_pre_llm_call(
+            session_id="new-sess",
+            is_first_turn=True,
+            platform="desktop",
+            sender_id="user123",
+        )
+        ctx = result.get("context", "")
+        assert "Platform context:" in ctx
 
 
 class TestRegister:
